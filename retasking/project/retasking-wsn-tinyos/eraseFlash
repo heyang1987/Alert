@@ -1,0 +1,197 @@
+#!/usr/bin/python2
+
+# Copyright (c) 2007 Johns Hopkins University.
+# All rights reserved.
+#
+ # Redistribution and use in source and binary forms, with or without
+ # modification, are permitted provided that the following conditions
+ # are met:
+ #
+ # - Redistributions of source code must retain the above copyright
+ #   notice, this list of conditions and the following disclaimer.
+ # - Redistributions in binary form must reproduce the above copyright
+ #   notice, this list of conditions and the following disclaimer in the
+ #   documentation and/or other materials provided with the
+ #   distribution.
+ # - Neither the name of the copyright holders nor the names of
+ #   its contributors may be used to endorse or promote products derived
+ #   from this software without specific prior written permission.
+ #
+ # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ # "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ # LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ # FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL
+ # THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ # INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ # (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ # SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ # HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ # OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# @author Razvan Musaloiu-E. <razvanm@cs.jhu.edu>
+# @author Chieh-Jan Mike Liang <cliang4@cs.jhu.edu>
+
+# yang
+from time import gmtime, strftime
+
+import sys, stat, struct, subprocess, time, os.path
+try:
+    import tos
+except ImportError:
+    import posix
+    sys.path = [os.path.join(posix.environ['TOSROOT'], 'support', 'sdk', 'python')] + sys.path
+    import tos
+
+# Path to the python script that builds Deluge image from XML
+PATH_PY_BUILD_IMAGE  = os.path.join(os.path.dirname(sys.argv[0]), 'tos-build-deluge-image')
+
+# TinyOS serial communication parameters
+FM_AMID = 0x53
+DM_AMID = 0x54
+SERIAL_DATA_LENGTH = 28 - (1+1+4+2)  # See definition of FMReqPacket below
+
+# Commands for FlashManager
+FM_CMD_ERASE     = 0
+FM_CMD_WRITE     = 1
+FM_CMD_READ      = 2
+FM_CMD_CRC       = 3
+FM_CMD_ADDR      = 4
+FM_CMD_SYNC      = 5
+FM_CMD_IDENT     = 6
+
+# Commands for DelugeManager
+DM_CMD_STOP             = 1
+DM_CMD_LOCAL_STOP       = 2
+DM_CMD_ONLY_DISSEMINATE = 3
+DM_CMD_DISSEMINATE_AND_REPROGRAM = 4
+DM_CMD_REPROGRAM        = 5
+DM_CMD_BOOT             = 6
+DM_CMD_DISSEMINATE_AND_REPROGRAM_NODES = 7 # Reprogram/Reboot nodes set in "nodeIds"
+DM_CMD_DISSEMINATE_AND_REPROGRAM_GROUP = 8 # Reprogram/Reboot nodes matching "groupId"
+DM_CMD_UPDATE_GROUP = 9 # Update nodes groupId
+
+ERROR_SUCCESS = 0   # T2-compatible
+ERROR_FAIL    = 1   # T2-compatible
+
+# Deluge parameters
+DELUGE_MAX_PAGES    = 128
+DELUGE_IDENT_OFFSET = 0
+DELUGE_IDENT_SIZE   = 128
+
+class FMReqPacket(tos.Packet):
+    def __init__(self, packet = None):
+        tos.Packet.__init__(self,
+                            [('cmd',    'int',  1),
+                             ('imgNum', 'int',  1),
+                             ('offset', 'int',  4),
+                             ('length', 'int',  2),
+                             ('data',   'blob', None)],
+                            packet)
+
+class DMReqPacket(tos.Packet):
+    def __init__(self, packet = None):
+        tos.Packet.__init__(self,
+                            [('cmd',    'int',  1),
+                             ('imgNum', 'int',  1),
+                             ('nodeIds', 'int', 4),
+                             ('groupId', 'int', 1)],
+                            packet)
+
+class SerialReplyPacket(tos.Packet):
+   def __init__(self, packet = None):
+       tos.Packet.__init__(self,
+                           [('error', 'int',  1),
+                            ('data',  'blob', None)],
+                           packet)
+
+class Ident(tos.Packet):
+    def __init__(self, packet = None):
+        tos.Packet.__init__(self,
+                            [('uidhash',  'int', 4),
+                             ('size',     'int', 4),
+                             ('pages',    'int', 1),
+                             ('reserved', 'int', 1),
+                             ('crc',      'int', 2),
+                             ('appname', 'string', 16),
+                             ('username', 'string', 16),
+                             ('hostname', 'string', 16),
+                             ('platform', 'string', 16),
+                             ('timestamp','int', 4),
+                             ('userhash', 'int', 4)],
+                            packet)
+
+class ShortIdent(tos.Packet):
+    def __init__(self, packet = None):
+        tos.Packet.__init__(self,
+                            [('appname',  'string', 16),
+                             ('timestamp','int', 4),
+                             ('uidhash',  'int', 4),
+                             ('nodeid',   'int', 2)],
+                            packet)
+
+def handleResponse(success, msg):
+    if success == True:
+        packet = am.read(timeout=2)
+        while packet and packet.type == 100:
+            print "".join([chr(i) for i in packet.data])
+            packet = am.read()
+        if not packet:
+            print "No response"
+            return False
+        reply = SerialReplyPacket(packet.data)
+        if reply.error == ERROR_SUCCESS:
+            return True
+        else:
+            print msg, reply
+            return False
+
+    print "ERROR: Unable to send the command"
+    return False
+
+def ident(timeout=None):
+    sreqpkt = FMReqPacket((FM_CMD_IDENT, 0, 0, 0, []))
+    if am.write(sreqpkt, FM_AMID, timeout=timeout):
+        packet = am.read(timeout=timeout)
+        reply = SerialReplyPacket(packet.data)
+        if reply.error == ERROR_SUCCESS:
+            return ShortIdent(reply.data)
+    return 0
+
+def erase(imgNum):
+    # Note: the normal erase doesn't work properly on AT45DB. A
+    # workaround is to do the normal erase (to make happy STM25P)
+    # and then overwrite the metadata (to make happy AT45DB).
+
+    sreqpkt = FMReqPacket((FM_CMD_ERASE, imgNum, 0, 0, []))
+    success = am.write(sreqpkt, FM_AMID)
+    result = handleResponse(success, "ERROR: Unable to erase the flash volume")
+    if result: return True;
+
+    print 'Attempt the workaround for AT45DB...'
+    sreqpkt = FMReqPacket((FM_CMD_WRITE, imgNum, 0, 0, []))
+    sreqpkt.data = [0xFF] * DELUGE_IDENT_SIZE
+    sreqpkt.length = DELUGE_IDENT_SIZE
+    success = am.write(sreqpkt, FM_AMID)
+    result = handleResponse(success, "ERROR: Unable to erase the flash volume")
+    if not result: return False;
+    return sync(imgNum)
+
+# ======== MAIN ======== #
+addr = tos.getSource("serial@/dev/ttyUSB0:115200")
+am = tos.AM(addr)
+
+try:
+    print "Checking if node is a Deluge T2 base station ..."
+    ident(timeout=1)
+except tos.Timeout:
+    print "ERROR: Timeout. Is the node a Deluge T2 base station?"
+    sys.exit(-1)
+
+if erase(1):
+    print "Image number 1 erased"
+
+print strftime("%Y-%m-%d %H:%M:%S")
+sys.exit()
+
